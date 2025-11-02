@@ -1,0 +1,2 @@
+[console_scripts]
+clause-miner = clause_miner.main:cli

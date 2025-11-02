@@ -1,0 +1,57 @@
+[project]
+name = "clause-miner"
+version = "0.1.0"
+description = "ClauseMiner: JP/WO/US patent publication parser, chunker, and BM25-based element matching."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Minoru Tomobe" }
+]
+keywords = ["patent", "JP", "WO", "US", "BM25", "RAG", "MCP", "Dify"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+]
+
+# ランタイム依存関係（最小）
+dependencies = [
+  # 依存ゼロで動く設計。必要に応じて下の extras で追加。
+]
+
+# 追加機能（uvでは `uv pip install -e .[dev]` のように使えます）
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.4",
+  "pytest-cov>=7.0",
+  "ruff>=0.6",
+  "mypy>=1.8",
+  "types-setuptools",
+]
+pdf = [
+  "pypdf>=6.0"
+]
+fast = [
+  "orjson>=3.9"
+]
+
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "B"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+no_implicit_optional = true
+disallow_untyped_defs = true
+strict_optional = true
+plugins = []
+
+# uv の挙動カスタム（私設PyPIや事前解決が必要な場合に追記）
+[tool.uv]
+# index-url = "https://pypi.org/simple"
+# extra-index-url = ["https://your-internal-index/simple"]
+prerelease = "allow"

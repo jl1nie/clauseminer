@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: clause-miner
+Version: 0.1.0
+Summary: ClauseMiner: JP/WO/US patent publication parser, chunker, and BM25-based element matching.
+Author: Minoru Tomobe
+Keywords: patent,JP,WO,US,BM25,RAG,MCP,Dify
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=8.4; extra == "dev"
+Requires-Dist: pytest-cov>=7.0; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"
+Requires-Dist: mypy>=1.8; extra == "dev"
+Requires-Dist: types-setuptools; extra == "dev"
+Provides-Extra: pdf
+Requires-Dist: pypdf>=6.0; extra == "pdf"
+Provides-Extra: fast
+Requires-Dist: orjson>=3.9; extra == "fast"
