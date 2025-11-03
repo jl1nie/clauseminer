@@ -169,7 +169,7 @@ python -m unittest tests.test_elements
 
 ### Preparing Test Data
 
-1. Patent text JSON: place the source text (e.g., `JP4743919B2.txt`) under `tests/data/` or supply it inline when calling `parse_jpo_plaintext()`.
+1. Patent text JSON: place the source text (e.g., `tests/fixtures/docs/JP4743919B2.txt`) under `tests/fixtures/docs/` or supply it inline when calling `parse_jpo_plaintext()`.
 2. Elements JSON: use `tests/fixtures/elements_jp4743919.json` as a template for new specs. Ensure each element has `id`, optional `weight`/`top_k`, and a non-empty list of cues `{term, synonyms?}`.
 3. When adding new fixtures, keep them UTF-8 encoded and reference them from the tests to avoid network fetches.
 4. For statistical verification, inspect `score`, `score_norm`, `chunk_score_total`, and cue-level `matched[].score` in the output to ensure scaling and normalization match expectations (`score_norm` will be a z-score unless `--normalize` overrides it).
