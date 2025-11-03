@@ -28,6 +28,21 @@ ClauseMiner extracts evidence snippets from JP/US/WO patent publications. It par
 
 `elements.json` must follow the new schema (legacy files are auto-upgraded):
 
+| Field      | Required | Type        | Description / Statistical meaning |
+|------------|----------|-------------|------------------------------------|
+| `id`       | ✅        | string      | Stable identifier used as the result key. Must be unique. |
+| `role`     | ❌ (default `must`) | string (`must` \| `should` \| `must_not`) | Drives eligibility: all `must` elements must hit (score ≥ τ), `should` contribute to final score, `must_not` filter chunks when score > 0. |
+| `term`     | ✅/auto   | string      | Representative phrase used for scoring; if omitted the first synonym is promoted. |
+| `synonyms` | ❌        | list[str]   | Additional variants evaluated independently; the maximum BM25 score is taken so variants do not double-count. Empty list allowed. |
+| `weight`   | ❌ (default 1.0) | float | Multiplier applied to the raw BM25 element score before aggregation. Can be used to up/down-weight specific concepts; effectively a linear scaling factor. |
+| `top_k`    | ❌        | int (>0)    | Per-element override for the number of top chunks to return. Falls back to global CLI `--top-k` otherwise. |
+
+Loader rules:
+- Missing `term` falls back to the first synonym.
+- Missing `role` defaults to `must`.
+- Synonyms are deduplicated; `label` (legacy) is ignored.
+- Validation ensures every element has at least one non-empty phrase.
+
 ```json
 {
   "elements": [
@@ -48,11 +63,6 @@ ClauseMiner extracts evidence snippets from JP/US/WO patent publications. It par
   ]
 }
 ```
-
-Loader rules:
-- Missing `term` falls back to the first synonym.
-- Missing `role` defaults to `must`.
-- Synonyms are deduplicated; `label` (legacy) is ignored.
 
 ### Output JSON
 
@@ -110,6 +120,34 @@ The CLI decides mode automatically:
 }
 ```
 
+#### Field reference
+
+**`meta`**
+- `mode`: `"chunked"` when long-mode runs, `"full"` otherwise.
+- `num_chunks`: count of generated chunks.
+- `avgdl`: average document length used inside BM25 (sum of chunk term-frequency lengths divided by chunk count).
+- `normalize`: normalization method selected (`none`, `zscore`, `minmax`).
+- `tau_must`: threshold applied to `must` elements (default 0.0).
+- `desc_paragraphs`, `desc_tokens`: statistics from the parsed description that drive mode selection.
+- `chunk_params`: present in chunked mode; echoes chunk/overlap sizes.
+
+**Per-element results (`results[element_id][]`)**
+
+| Field | Description / Statistical meaning |
+|-------|-----------------------------------|
+| `element_id` | Echoes the source element ID. |
+| `role` | Role used during eligibility (`must`/`should`). |
+| `element_term` | Canonical phrase used for scoring. |
+| `matched_variant` | Variant (term or synonym) that achieved the maximum BM25 score for this chunk. |
+| `chunk_idx` | Index of the chunk within the processed document. |
+| `start_para`, `end_para` | Paragraph boundaries (inclusive, zero-based). |
+| `section` | Majority section label across the chunk’s paragraphs. |
+| `score` | Weighted BM25 score: `BM25_max_variant × weight`. Higher is better. |
+| `score_norm` | Normalized score using the configured method; with `zscore` it is `(score - μ) / σ` inside the element’s result list. |
+| `chunk_score_total` | Sum of weighted scores over all `must` and `should` elements for the chunk; useful for ranking across elements. |
+| `chunk` | (Optional) Raw chunk text, present when `--include-text` is `true` (default in chunked mode). |
+| `chunk_highlight` | (Optional) Highlighted snippet when `--highlight` is enabled. |
+
 ## 2. Testing
 
 ### Test Suite
@@ -129,3 +167,4 @@ python -m unittest tests.test_elements
 1. Patent text JSON: place the source text (e.g., `JP4743919B2.txt`) under `tests/data/` or supply it inline when calling `parse_jpo_plaintext()`.
 2. Elements JSON: use `tests/data/elements_jp4743919.json` as a template for new specs. Ensure each element has `id`, `role`, `term`, and optional `synonyms`, `weight`, `top_k`.
 3. When adding new fixtures, keep them UTF-8 encoded and reference them from the tests to avoid network fetches.
+4. For statistical verification, inspect `score`, `score_norm`, and `chunk_score_total` in the output to ensure scaling and normalization match expectations (`score_norm` will be a z-score unless `--normalize` overrides it).
