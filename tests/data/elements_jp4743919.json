@@ -1,0 +1,62 @@
+{
+  "elements": [
+    {
+      "id": "E1",
+      "role": "must",
+      "term": "タッチスクリーンディスプレイ",
+      "synonyms": [
+        "タッチスクリーン",
+        "touch screen display",
+        "タッチパネル",
+        "タッチスクリーン装置"
+      ],
+      "weight": 1.0,
+      "top_k": 5
+    },
+    {
+      "id": "E2",
+      "role": "must",
+      "term": "電子ドキュメント",
+      "synonyms": [
+        "ドキュメント",
+        "文書",
+        "電子文書",
+        "document"
+      ],
+      "weight": 1.0
+    },
+    {
+      "id": "E3",
+      "role": "should",
+      "term": "スクロール",
+      "synonyms": [
+        "スクローリング",
+        "スクロールする",
+        "scroll",
+        "スクロール操作"
+      ],
+      "weight": 0.6
+    },
+    {
+      "id": "E4",
+      "role": "should",
+      "term": "縁を越えるエリア",
+      "synonyms": [
+        "オーバースクロール",
+        "超過表示",
+        "越境表示",
+        "edge beyond"
+      ],
+      "weight": 0.4
+    },
+    {
+      "id": "NG1",
+      "role": "must_not",
+      "term": "キーボード入力のみ",
+      "synonyms": [
+        "キーボードだけ",
+        "keyboard only"
+      ]
+    }
+  ]
+}

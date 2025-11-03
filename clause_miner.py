@@ -27,8 +27,9 @@ cat input.txt | python evidence_pipeline_full_auto.py --elements elements.json >
 
 from __future__ import annotations
 import math, re, unicodedata, json, sys, argparse
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from pathlib import Path
 
 # ------------------------------
@@ -40,8 +41,8 @@ def normalize_text(text: str) -> str:
         return ""
     t = unicodedata.normalize("NFKC", text)
     # control chars -> space, collapse whitespace
-    t = re.sub(r"[\\u0000-\\u001F\\u007F]", " ", t)
-    t = re.sub(r"\\s+", " ", t).strip()
+    t = re.sub(r"[\u0000-\u001F\u007F]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
     # lowercase ASCII; make sure '-' is last inside class to avoid ranges
     t = re.sub(r"[A-Z0-9%./-]+", lambda m: m.group(0).lower(), t)
     return t
@@ -50,12 +51,15 @@ def normalize_text(text: str) -> str:
 # Parser (JP heuristics)
 # ------------------------------
 SECTION_PATTERNS = {
-    "title": [r"【?発明の名称】?", r"【?名称】?", r"\\btitle\\b"],
-    "abstract": [r"【?要約】?", r"【?概要】?", r"\\babstract\\b"],
-    "claims": [r"【?特許請求の範囲】?", r"【?請求項】?", r"特許請求の範囲", r"\\bclaims?\\b"],
-    "description": [r"【?発明の詳細な説明】?", r"発明の詳細な説明", r"【?詳細な説明】?", r"\\bdetailed description\\b"],
+    "title": [r"【?発明の名称】?", r"【?名称】?", r"\btitle\b"],
+    "abstract": [r"【?要約】?", r"【?概要】?", r"\babstract\b"],
+    "claims": [r"【?特許請求の範囲】?", r"【?請求項】?", r"特許請求の範囲", r"\bclaims?\b"],
+    "description": [r"【?発明の詳細な説明】?", r"発明の詳細な説明", r"【?詳細な説明】?", r"\bdetailed description\b"],
 }
-CLAIM_ITEM_PATTERNS = [r"【?請求項\\s*([0-9０-９]+)】?", r"\\bclaim\\s*(\\d+)\\b"]
+CLAIM_ITEM_PATTERNS = [
+    r"【請求項\s*([0-9０-９]+)】",
+    r"^\s*(?:claim|clause)\s*(\d+)\b",
+]
 
 @dataclass
 class ParsedJP:
@@ -77,7 +81,17 @@ def _locate_sections(text: str) -> Dict[str, List[Tuple[int, re.Match]]]:
 def parse_jpo_plaintext(raw_text: str) -> ParsedJP:
     """Split JP publication plain text into sections and paragraphs."""
     text = normalize_text(raw_text)
+    text = text.replace("\ufeff", "")
     marks = _locate_sections(text)
+
+    # Drop abstract markers that appear after claims/description headers (false positives).
+    guard_candidates = []
+    for sec in ("claims", "description"):
+        if marks[sec]:
+            guard_candidates.append(marks[sec][0][0])
+    guard = min(guard_candidates) if guard_candidates else None
+    if guard is not None and marks["abstract"]:
+        marks["abstract"] = [(pos, m) for pos, m in marks["abstract"] if pos < guard]
 
     # unify all markers to compute section boundaries
     all_marks: List[Tuple[int, str]] = []
@@ -97,7 +111,7 @@ def parse_jpo_plaintext(raw_text: str) -> ParsedJP:
     ti = first("title")
     if ti is not None:
         seg = text[ti: ti + 200]
-        seg = re.sub(r"^.*?(発明の名称|名称|title)\\s*", "", seg, flags=re.IGNORECASE)
+        seg = re.sub(r"^.*?(発明の名称|名称|title)】?\s*", "", seg, flags=re.IGNORECASE)
         title = seg.split(" ", 1)[0][:120]
     else:
         title = text[:120].split(" ", 1)[0]
@@ -108,7 +122,7 @@ def parse_jpo_plaintext(raw_text: str) -> ParsedJP:
     if ai is not None:
         next_after = next((pos for pos, _sec in all_marks if pos > ai), None)
         body = slice_between(ai, next_after)
-        abstract = re.sub(r"^.*?(要約|概要|abstract)\\s*", "", body, flags=re.IGNORECASE).strip()
+        abstract = re.sub(r"^.*?(要約|概要|abstract)】?\s*", "", body, flags=re.IGNORECASE).strip()
 
     # Claims
     claims_block = ""
@@ -120,30 +134,30 @@ def parse_jpo_plaintext(raw_text: str) -> ParsedJP:
     if claims_block:
         items: List[Tuple[int, re.Match]] = []
         for pat in CLAIM_ITEM_PATTERNS:
-            for m in re.finditer(pat, claims_block, flags=re.IGNORECASE):
+            for m in re.finditer(pat, claims_block, flags=re.IGNORECASE | re.MULTILINE):
                 items.append((m.start(), m))
         items.sort(key=lambda x: x[0])
         if items:
             for i, (pos, _m) in enumerate(items):
                 endp = items[i + 1][0] if i + 1 < len(items) else None
                 seg = claims_block[pos:endp]
-                seg = re.sub(r"^【?請求項\\s*[0-9０-９]+】?\\s*", "", seg)
+                seg = re.sub(r"^【?請求項\s*[0-9０-９]+】?\s*", "", seg)
                 claims.append(seg.strip())
         else:
             # Fallback: split by simple numbered lines like "(1) " or "1. "
-            tmp = re.split(r"(?:(?:^|\\s))(?:\\(\\d+\\)|\\d+\\.)\\s+", claims_block)
+            tmp = re.split(r"(?:(?:^|\s))(?:\(\d+\)|\d+\.)\s+", claims_block)
             claims = [t.strip() for t in tmp if t.strip()]
 
     # Description
     di = first("description")
     if di is not None:
         description = slice_between(di, None)
-        description = re.sub(r"^.*?(発明の詳細な説明|詳細な説明|detailed description)\\s*", "", description, flags=re.IGNORECASE).strip()
+        description = re.sub(r"^.*?(発明の詳細な説明|詳細な説明|detailed description)】?\s*", "", description, flags=re.IGNORECASE).strip()
     else:
         description = text[text.find(claims_block) + len(claims_block):].strip() if claims_block else text
 
     # Paragraphs (coarse split by 。 or .)
-    paragraphs = [p.strip() for p in re.split(r"(?<=。)|(?<=\\.)\\s+", description) if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r"(?<=。)\s+|(?<=\.)\s+", description) if p.strip()]
     return ParsedJP(title=title, abstract=abstract, claims=claims, description=description, paragraphs=paragraphs)
 
 # ------------------------------
@@ -163,19 +177,19 @@ SECTION_TAG_PATTERNS = [
     (re.compile(r"^【?図面の簡単な説明】?"), "図面の簡単な説明/Brief Description of Drawings"),
     (re.compile(r"^【?産業上の利用可能性】?"), "産業上の利用可能性/Industrial Applicability"),
     # EN headers (\b only)
-    (re.compile(r"^(technical field)\\b", re.IGNORECASE), "技術分野/Technical Field"),
-    (re.compile(r"^(background(?: art)?)\\b", re.IGNORECASE), "背景技術/Background Art"),
-    (re.compile(r"^(summary|summary of the invention)\\b", re.IGNORECASE), "概要/Summary"),
-    (re.compile(r"^(problem to be solved)\\b", re.IGNORECASE), "課題/Problem to be Solved"),
-    (re.compile(r"^(solution|means for solving the problem)\\b", re.IGNORECASE), "解決手段/Solution"),
-    (re.compile(r"^(effects?|advantages?)\\b", re.IGNORECASE), "効果/Effects"),
-    (re.compile(r"^(brief description of the drawings)\\b", re.IGNORECASE), "図面の簡単な説明/Brief Description of Drawings"),
-    (re.compile(r"^(detailed description|description of (?:the )?(?:embodiments|invention))\\b", re.IGNORECASE), "詳細説明/Detailed Description"),
-    (re.compile(r"^(embodiments?)\\b", re.IGNORECASE), "実施形態/Embodiments"),
-    (re.compile(r"^(examples?)\\b", re.IGNORECASE), "実施例/Examples"),
-    (re.compile(r"^(comparative examples?)\\b", re.IGNORECASE), "比較例/Comparative Examples"),
-    (re.compile(r"^(modifications?|variations?)\\b", re.IGNORECASE), "変形例/Modifications"),
-    (re.compile(r"^(industrial applicability)\\b", re.IGNORECASE), "産業上の利用可能性/Industrial Applicability"),
+    (re.compile(r"^(technical field)\b", re.IGNORECASE), "技術分野/Technical Field"),
+    (re.compile(r"^(background(?: art)?)\b", re.IGNORECASE), "背景技術/Background Art"),
+    (re.compile(r"^(summary|summary of the invention)\b", re.IGNORECASE), "概要/Summary"),
+    (re.compile(r"^(problem to be solved)\b", re.IGNORECASE), "課題/Problem to be Solved"),
+    (re.compile(r"^(solution|means for solving the problem)\b", re.IGNORECASE), "解決手段/Solution"),
+    (re.compile(r"^(effects?|advantages?)\b", re.IGNORECASE), "効果/Effects"),
+    (re.compile(r"^(brief description of the drawings)\b", re.IGNORECASE), "図面の簡単な説明/Brief Description of Drawings"),
+    (re.compile(r"^(detailed description|description of (?:the )?(?:embodiments|invention))\b", re.IGNORECASE), "詳細説明/Detailed Description"),
+    (re.compile(r"^(embodiments?)\b", re.IGNORECASE), "実施形態/Embodiments"),
+    (re.compile(r"^(examples?)\b", re.IGNORECASE), "実施例/Examples"),
+    (re.compile(r"^(comparative examples?)\b", re.IGNORECASE), "比較例/Comparative Examples"),
+    (re.compile(r"^(modifications?|variations?)\b", re.IGNORECASE), "変形例/Modifications"),
+    (re.compile(r"^(industrial applicability)\b", re.IGNORECASE), "産業上の利用可能性/Industrial Applicability"),
 ]
 
 def tag_paragraphs(paragraphs: List[str]) -> List[str]:
@@ -192,7 +206,7 @@ def tag_paragraphs(paragraphs: List[str]) -> List[str]:
 # ------------------------------
 # Tokenizer & BM25
 # ------------------------------
-WORD_RE = re.compile(r"[a-z0-9]+(?:[-_/][a-z0-9]+)*|[µ%℃°]+|[0-9]+(?:\\.[0-9]+)?")
+WORD_RE = re.compile(r"[a-z0-9]+(?:[-_/][a-z0-9]+)*|[µ%℃°]+|[0-9]+(?:\.[0-9]+)?")
 
 def tokenize(s: str) -> List[str]:
     s = normalize_text(s)
@@ -280,25 +294,162 @@ def build_bm25_index(chunks: List[Chunk]) -> BM25Index:
 # Elements & scoring
 # ------------------------------
 @dataclass
-class Element:
+class ElementDef:
     id: str
+    role: str                 # "must" | "should" | "must_not"
+    term: str
     synonyms: List[str]
     weight: float = 1.0
-    label: str | None = None
+    top_k: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.role = self.role.lower()
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def load_elements(path: str) -> List[Dict[str, Any]]:
+    """
+    Load JSON, validate the structure, and normalize into a flat dict list.
+
+    Backward compatibility:
+        - If 'term' missing -> use first synonym.
+        - Missing role -> assume 'must'.
+        - Ignore legacy 'label' fields.
+    """
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "elements" in raw:
+        items = raw["elements"]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ValueError("elements.json must be a dict with 'elements' or a list")
+
+    if not isinstance(items, list):
+        raise ValueError("elements list must be an array")
+
+    normalized: List[Dict[str, Any]] = []
+    seen_ids: Set[str] = set()
+
+    for idx, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Element at index {idx} is not an object")
+        elem_id = str(item.get("id") or "").strip()
+        if not elem_id:
+            raise ValueError(f"Element at index {idx} missing 'id'")
+        if elem_id in seen_ids:
+            raise ValueError(f"Duplicate element id '{elem_id}'")
+        seen_ids.add(elem_id)
+
+        role = str(item.get("role", "must")).lower().strip()
+        if role not in {"must", "should", "must_not"}:
+            raise ValueError(f"Element '{elem_id}' has invalid role '{role}'")
+
+        synonyms_raw = item.get("synonyms", [])
+        if synonyms_raw is None:
+            synonyms_raw = []
+        if isinstance(synonyms_raw, str):
+            synonyms_raw = [synonyms_raw]
+        if not isinstance(synonyms_raw, list):
+            raise ValueError(f"Element '{elem_id}' synonyms must be a list or string")
+        synonyms = [str(s).strip() for s in synonyms_raw if str(s).strip()]
+
+        term = str(item.get("term") or "").strip()
+        if not term:
+            if synonyms:
+                term = synonyms[0]
+            else:
+                raise ValueError(f"Element '{elem_id}' requires a 'term' or non-empty synonyms")
+        if not term:
+            raise ValueError(f"Element '{elem_id}' term cannot be empty")
+
+        # Remove term duplicates from synonyms and dedupe.
+        normalized_synonyms = _dedupe_preserve_order(s for s in synonyms if s != term)
+
+        weight = float(item.get("weight", 1.0))
+
+        top_k_val = item.get("top_k")
+        top_k: Optional[int]
+        if top_k_val is None:
+            top_k = None
+        else:
+            try:
+                top_k = int(top_k_val)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Element '{elem_id}' top_k must be an integer") from exc
+            if top_k <= 0:
+                raise ValueError(f"Element '{elem_id}' top_k must be > 0")
+
+        normalized.append({
+            "id": elem_id,
+            "role": role,
+            "term": term,
+            "synonyms": normalized_synonyms,
+            "weight": weight,
+            "top_k": top_k,
+        })
+
+    return normalized
+
+
+def to_element_defs(objs: List[Dict[str, Any]]) -> List[ElementDef]:
+    return [
+        ElementDef(
+            id=obj["id"],
+            role=obj["role"],
+            term=obj["term"],
+            synonyms=list(obj.get("synonyms", [])),
+            weight=float(obj.get("weight", 1.0)),
+            top_k=obj.get("top_k"),
+        )
+        for obj in objs
+    ]
+
+
+def variants_of(e: ElementDef) -> List[str]:
+    return [e.term] + _dedupe_preserve_order(e.synonyms)
+
 
 def phrase_to_terms(phrase: str) -> List[str]:
     return tokenize(phrase)
 
+
 def bm25_phrase_score(index: BM25Index, ch: Chunk, phrase: str) -> float:
     return sum(index.score(ch.term_freq.get(t, 0), len(ch.term_freq), t) for t in phrase_to_terms(phrase))
 
-def element_score(index: BM25Index, ch: Chunk, elem: Element) -> Tuple[float, str]:
-    if not elem.synonyms: return 0.0, ""
-    best, best_syn = 0.0, ""
-    for syn in elem.synonyms:
-        s = bm25_phrase_score(index, ch, syn)
-        if s > best: best, best_syn = s, syn
-    return elem.weight * best, best_syn
+
+def element_chunk_score(index: BM25Index, ch: Chunk, e: ElementDef) -> Tuple[float, str]:
+    best_score = 0.0
+    best_variant = ""
+    for variant in variants_of(e):
+        score = bm25_phrase_score(index, ch, variant)
+        if score > best_score:
+            best_score = score
+            best_variant = variant
+    return best_score, best_variant
+
+
+def chunk_eligible(
+    must_scores: Dict[str, float],
+    must_not_scores: Dict[str, float],
+    tau_must: float = 0.0,
+) -> bool:
+    if any(score < tau_must for score in must_scores.values()):
+        return False
+    if any(score > 0.0 for score in must_not_scores.values()):
+        return False
+    return True
 
 # ------------------------------
 # Normalization utilities
@@ -325,7 +476,7 @@ def normalize_scores(values: List[float], method: str) -> List[float]:
 def _build_phrase_regex(phrase: str) -> re.Pattern:
     p = unicodedata.normalize("NFKC", phrase or "")
     p = re.escape(p)
-    p = p.replace(r"\\ ", r"\\s+")
+    p = p.replace(r"\ ", r"\s+")
     return re.compile(p, flags=re.IGNORECASE)
 
 def _highlight_sentence(sentence: str, phrase_pat: re.Pattern) -> str | None:
@@ -345,7 +496,7 @@ def _highlight_sentence(sentence: str, phrase_pat: re.Pattern) -> str | None:
 # ------------------------------
 def chunk_and_rank(
     parsed: ParsedJP,
-    elements: List[Element],
+    elements: List[ElementDef],
     chunk_tokens: int = 600,
     overlap_tokens: int = 120,
     top_k: int = 3,
@@ -356,40 +507,77 @@ def chunk_and_rank(
     adjacent_penalty: float = 0.7,
     highlight: bool = False,
     normalize_method: str = "zscore",
+    tau_must: float = 0.0,
 ) -> Dict[str, Any]:
     if overlap_ratio is not None:
         overlap_tokens = max(0, int(round(chunk_tokens * float(overlap_ratio))))
     chunks = build_chunks(parsed.paragraphs, target_tokens=chunk_tokens, overlap_tokens=overlap_tokens)
     index = build_bm25_index(chunks)
     para_tags = tag_paragraphs(parsed.paragraphs)
-    from collections import Counter
+
     def chunk_section(ch: Chunk) -> str:
         sl = para_tags[ch.start_para: ch.end_para + 1]
         return Counter(sl).most_common(1)[0][0] if sl else "不明/Unknown"
 
-    results: Dict[str, List[Dict[str, Any]]] = {}
-    for elem in elements:
-        scored: List[Dict[str, Any]] = []
-        for ch in chunks:
-            s, syn = element_score(index, ch, elem)
-            if s > 0:
-                e = {
-                    "element_id": elem.id,
-                    "element_label": (elem.label or elem.id),
-                    "chunk_idx": ch.idx,
-                    "start_para": ch.start_para,
-                    "end_para": ch.end_para,
-                    "section": chunk_section(ch),
-                    "score": s,
-                    "matched_synonym": syn,
-                }
-                if include_text:
-                    e["chunk"] = ch.text
-                scored.append(e)
+    must_elements = [e for e in elements if e.role == "must"]
+    should_elements = [e for e in elements if e.role == "should"]
+    must_not_elements = [e for e in elements if e.role == "must_not"]
 
-        # adjacency penalty then normalize & top-k
+    results: Dict[str, List[Dict[str, Any]]] = {e.id: [] for e in elements}
+
+    for ch in chunks:
+        per_element: Dict[str, Tuple[float, str]] = {}
+        for e in elements:
+            per_element[e.id] = element_chunk_score(index, ch, e)
+
+        must_scores = {e.id: per_element[e.id][0] for e in must_elements}
+        must_not_scores = {e.id: per_element[e.id][0] for e in must_not_elements}
+
+        if not chunk_eligible(must_scores, must_not_scores, tau_must=tau_must):
+            continue
+
+        section = chunk_section(ch)
+        chunk_text = ch.text if include_text else None
+        total_score = sum(
+            per_element[e.id][0] * e.weight
+            for e in (*must_elements, *should_elements)
+        )
+
+        for e in elements:
+            if e.role == "must_not":
+                continue
+            raw_score, variant = per_element[e.id]
+            if raw_score <= 0:
+                continue
+            weighted = raw_score * e.weight
+            if weighted <= 0:
+                continue
+            entry: Dict[str, Any] = {
+                "element_id": e.id,
+                "role": e.role,
+                "element_term": e.term,
+                "matched_variant": variant,
+                "chunk_idx": ch.idx,
+                "start_para": ch.start_para,
+                "end_para": ch.end_para,
+                "section": section,
+                "score": weighted,
+                "chunk_score_total": total_score,
+            }
+            if include_text:
+                entry["chunk"] = chunk_text
+            if highlight and variant and chunk_text:
+                phrase_pat = _build_phrase_regex(variant)
+                highlighted = _highlight_sentence(chunk_text, phrase_pat)
+                if highlighted:
+                    entry["chunk_highlight"] = highlighted
+            results[e.id].append(entry)
+
+    # Adjacency suppression & normalization per element
+    for e in elements:
+        scored = results[e.id]
         scored.sort(key=lambda x: x["score"], reverse=True)
-        if suppress_adjacent:
+        if suppress_adjacent and scored:
             for i in range(len(scored)):
                 ci = scored[i]["chunk_idx"]
                 for j in range(i + 1, len(scored)):
@@ -403,12 +591,21 @@ def chunk_and_rank(
         for d, nv in zip(scored, vals_n):
             d["score_norm"] = nv
 
-        results[elem.id] = scored[:top_k]
+        per_element_top_k = e.top_k if e.top_k is not None else top_k
+        results[e.id] = scored[:per_element_top_k]
 
     chunks_out = [{"idx": ch.idx, "start_para": ch.start_para, "end_para": ch.end_para} for ch in index.chunks]
 
-    return {"meta": {"num_chunks": len(index.chunks), "avgdl": index.avgdl, "normalize": normalize_method},
-            "chunks": chunks_out, "results": results}
+    return {
+        "meta": {
+            "num_chunks": len(index.chunks),
+            "avgdl": index.avgdl,
+            "normalize": normalize_method,
+            "tau_must": tau_must,
+        },
+        "chunks": chunks_out,
+        "results": results,
+    }
 
 # ------------------------------
 # CLI main
@@ -419,10 +616,8 @@ def main():
     DEFAULT_TOP_K = 3
     DEFAULT_NORMALIZE = "zscore"
     DEFAULT_HIGHLIGHT = False
-    # DEFAULT_THRESH_PARAS = 150
-    # DEFAULT_THRESH_TOKENS = 60000
-    DEFAULT_THRESH_PARAS = 15
-    DEFAULT_THRESH_TOKENS = 600
+    DEFAULT_THRESH_PARAS = 150
+    DEFAULT_THRESH_TOKENS = 60000
 
     ap = argparse.ArgumentParser(description="Evidence pipeline (JP patents; long=results only / short=raw only)")
     ap.add_argument("--elements", required=True, help="Path to elements.json")
@@ -447,10 +642,7 @@ def main():
 
     # load
     text = Path(args.input).read_text(encoding="utf-8") if args.input else sys.stdin.read()
-    data = json.loads(Path(args.elements).read_text(encoding="utf-8"))
-    elems_raw = data["elements"] if isinstance(data, dict) and "elements" in data else data
-    elements = [Element(id=e["id"], synonyms=e.get("synonyms", []), weight=e.get("weight", 1.0), label=e.get("label"))
-                for e in elems_raw]
+    elements = to_element_defs(load_elements(args.elements))
 
     # parse & measure
     parsed = parse_jpo_plaintext(text)
@@ -483,7 +675,7 @@ def main():
             chunk_tokens=args.chunk_tokens,
             overlap_tokens=args.overlap_tokens,
             top_k=args.top_k,
-            include_text=True,
+            include_text=args.include_text,
             highlight=args.highlight,
             normalize_method=args.normalize,
         )
