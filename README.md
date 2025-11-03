@@ -31,34 +31,40 @@ ClauseMiner extracts evidence snippets from JP/US/WO patent publications. It par
 | Field      | Required | Type        | Description / Statistical meaning |
 |------------|----------|-------------|------------------------------------|
 | `id`       | ✅        | string      | Stable identifier used as the result key. Must be unique. |
-| `role`     | ❌ (default `must`) | string (`must` \| `should` \| `must_not`) | Drives eligibility: all `must` elements must hit (score ≥ τ), `should` contribute to final score, `must_not` filter chunks when score > 0. |
-| `term`     | ✅/auto   | string      | Representative phrase used for scoring; if omitted the first synonym is promoted. |
-| `synonyms` | ❌        | list[str]   | Additional variants evaluated independently; the maximum BM25 score is taken so variants do not double-count. Empty list allowed. |
-| `weight`   | ❌ (default 1.0) | float | Multiplier applied to the raw BM25 element score before aggregation. Can be used to up/down-weight specific concepts; effectively a linear scaling factor. |
-| `top_k`    | ❌        | int (>0)    | Per-element override for the number of top chunks to return. Falls back to global CLI `--top-k` otherwise. |
+| `weight`   | ❌ (default 1.0) | float | Linear multiplier applied after summing cue scores. |
+| `top_k`    | ❌        | int (>0)    | Per-element override for the number of top chunks to return (falls back to global `--top-k`). |
+| `cues`     | ✅        | list        | Non-empty list of cue objects. All cues are AND-ed. |
+
+Cue object fields:
+
+| Cue field  | Required | Description |
+|------------|----------|-------------|
+| `term`     | ✅        | Representative phrase for the cue. |
+| `synonyms` | ❌        | Array of additional variants; deduped automatically. Variants are OR-ed (max score). |
 
 Loader rules:
-- Missing `term` falls back to the first synonym.
-- Missing `role` defaults to `must`.
-- Synonyms are deduplicated; `label` (legacy) is ignored.
-- Validation ensures every element has at least one non-empty phrase.
+- Missing `cues` falls back to the legacy `{term?, synonyms}` shape.
+- If `term` is missing but synonyms exist, the first synonym is promoted to `term`.
+- Synonyms are deduplicated; legacy `label` is ignored.
+- Validation ensures every element has a resolvable term and at least one cue.
 
 ```json
 {
   "elements": [
     {
       "id": "E1",
-      "role": "must",
-      "term": "セッション管理",
-      "synonyms": ["session", "セッション", "セッショントークン"],
       "weight": 1.0,
-      "top_k": 5
+      "top_k": 3,
+      "cues": [
+        { "term": "セッション管理", "synonyms": ["session", "セッション", "cookie", "トークン"] },
+        { "term": "ユーザ認証",     "synonyms": ["authentication", "認証", "ログイン"] }
+      ]
     },
     {
-      "id": "NG1",
-      "role": "must_not",
-      "term": "完全にステートレス",
-      "synonyms": ["stateless only"]
+      "id": "E2",
+      "cues": [
+        { "term": "改ざん検出", "synonyms": ["tamper detection", "改ざん", "署名検証"] }
+      ]
     }
   ]
 }
@@ -75,7 +81,7 @@ The CLI decides mode automatically:
     "mode": "chunked",
     "num_chunks": 190,
     "normalize": "zscore",
-    "tau_must": 0.0,
+    "tau_cue": 0.0,
     "desc_paragraphs": 240,
     "desc_tokens": 112695,
     "chunk_params": {"chunk_tokens": 600, "overlap_tokens": 120}
@@ -87,9 +93,6 @@ The CLI decides mode automatically:
     "E1": [
       {
         "element_id": "E1",
-        "role": "must",
-        "element_term": "タッチスクリーンディスプレイ",
-        "matched_variant": "タッチスクリーンディスプレイ",
         "chunk_idx": 14,
         "start_para": 15,
         "end_para": 16,
@@ -97,10 +100,13 @@ The CLI decides mode automatically:
         "score": 24.67,
         "score_norm": 2.07,
         "chunk_score_total": 39.70,
-        "chunk": "<chunk text>"
+        "chunk": "<chunk text>",
+        "matched": [
+          { "cue_term": "セッション管理", "variant": "セッション管理", "score": 12.85 },
+          { "cue_term": "ユーザ認証",     "variant": "認証",         "score": 11.82 }
+        ]
       }
-    ],
-    "NG1": []
+    ]
   }
 }
 ```
@@ -127,7 +133,7 @@ The CLI decides mode automatically:
 - `num_chunks`: count of generated chunks.
 - `avgdl`: average document length used inside BM25 (sum of chunk term-frequency lengths divided by chunk count).
 - `normalize`: normalization method selected (`none`, `zscore`, `minmax`).
-- `tau_must`: threshold applied to `must` elements (default 0.0).
+- `tau_cue`: cue-level threshold (default 0.0; scores must exceed it).
 - `desc_paragraphs`, `desc_tokens`: statistics from the parsed description that drive mode selection.
 - `chunk_params`: present in chunked mode; echoes chunk/overlap sizes.
 
@@ -136,17 +142,15 @@ The CLI decides mode automatically:
 | Field | Description / Statistical meaning |
 |-------|-----------------------------------|
 | `element_id` | Echoes the source element ID. |
-| `role` | Role used during eligibility (`must`/`should`). |
-| `element_term` | Canonical phrase used for scoring. |
-| `matched_variant` | Variant (term or synonym) that achieved the maximum BM25 score for this chunk. |
 | `chunk_idx` | Index of the chunk within the processed document. |
 | `start_para`, `end_para` | Paragraph boundaries (inclusive, zero-based). |
 | `section` | Majority section label across the chunk’s paragraphs. |
-| `score` | Weighted BM25 score: `BM25_max_variant × weight`. Higher is better. |
+| `score` | Weighted BM25 score: sum of cue scores multiplied by element weight. |
 | `score_norm` | Normalized score using the configured method; with `zscore` it is `(score - μ) / σ` inside the element’s result list. |
-| `chunk_score_total` | Sum of weighted scores over all `must` and `should` elements for the chunk; useful for ranking across elements. |
+| `chunk_score_total` | Sum of all element scores for the chunk (global AND aggregation). |
 | `chunk` | (Optional) Raw chunk text, present when `--include-text` is `true` (default in chunked mode). |
 | `chunk_highlight` | (Optional) Highlighted snippet when `--highlight` is enabled. |
+| `matched` | List of cue matches; each entry contains `cue_term`, winning `variant`, and raw cue `score`. |
 
 ## 2. Testing
 
@@ -159,12 +163,13 @@ python -m unittest tests.test_elements
 
 `tests/test_elements.py` covers:
 - Backward-compatible element loading.
-- Must/must_not gating behaviour.
-- Synonym variant selection.
+- Cue-level AND logic inside an element.
+- Element-level AND logic across the set.
+- Synonym max-variant selection and matched reporting.
 
 ### Preparing Test Data
 
 1. Patent text JSON: place the source text (e.g., `JP4743919B2.txt`) under `tests/data/` or supply it inline when calling `parse_jpo_plaintext()`.
-2. Elements JSON: use `tests/data/elements_jp4743919.json` as a template for new specs. Ensure each element has `id`, `role`, `term`, and optional `synonyms`, `weight`, `top_k`.
+2. Elements JSON: use `tests/data/elements_jp4743919.json` as a template for new specs. Ensure each element has `id`, optional `weight`/`top_k`, and a non-empty list of cues `{term, synonyms?}`.
 3. When adding new fixtures, keep them UTF-8 encoded and reference them from the tests to avoid network fetches.
-4. For statistical verification, inspect `score`, `score_norm`, and `chunk_score_total` in the output to ensure scaling and normalization match expectations (`score_norm` will be a z-score unless `--normalize` overrides it).
+4. For statistical verification, inspect `score`, `score_norm`, `chunk_score_total`, and cue-level `matched[].score` in the output to ensure scaling and normalization match expectations (`score_norm` will be a z-score unless `--normalize` overrides it).

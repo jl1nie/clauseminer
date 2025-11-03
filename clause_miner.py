@@ -293,19 +293,6 @@ def build_bm25_index(chunks: List[Chunk]) -> BM25Index:
 # ------------------------------
 # Elements & scoring
 # ------------------------------
-@dataclass
-class ElementDef:
-    id: str
-    role: str                 # "must" | "should" | "must_not"
-    term: str
-    synonyms: List[str]
-    weight: float = 1.0
-    top_k: Optional[int] = None
-
-    def __post_init__(self) -> None:
-        self.role = self.role.lower()
-
-
 def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
@@ -324,9 +311,8 @@ def load_elements(path: str) -> List[Dict[str, Any]]:
     Load JSON, validate the structure, and normalize into a flat dict list.
 
     Backward compatibility:
+        - If cues missing, upgrade old format {term?, synonyms}.
         - If 'term' missing -> use first synonym.
-        - Missing role -> assume 'must'.
-        - Ignore legacy 'label' fields.
     """
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "elements" in raw:
@@ -352,31 +338,6 @@ def load_elements(path: str) -> List[Dict[str, Any]]:
             raise ValueError(f"Duplicate element id '{elem_id}'")
         seen_ids.add(elem_id)
 
-        role = str(item.get("role", "must")).lower().strip()
-        if role not in {"must", "should", "must_not"}:
-            raise ValueError(f"Element '{elem_id}' has invalid role '{role}'")
-
-        synonyms_raw = item.get("synonyms", [])
-        if synonyms_raw is None:
-            synonyms_raw = []
-        if isinstance(synonyms_raw, str):
-            synonyms_raw = [synonyms_raw]
-        if not isinstance(synonyms_raw, list):
-            raise ValueError(f"Element '{elem_id}' synonyms must be a list or string")
-        synonyms = [str(s).strip() for s in synonyms_raw if str(s).strip()]
-
-        term = str(item.get("term") or "").strip()
-        if not term:
-            if synonyms:
-                term = synonyms[0]
-            else:
-                raise ValueError(f"Element '{elem_id}' requires a 'term' or non-empty synonyms")
-        if not term:
-            raise ValueError(f"Element '{elem_id}' term cannot be empty")
-
-        # Remove term duplicates from synonyms and dedupe.
-        normalized_synonyms = _dedupe_preserve_order(s for s in synonyms if s != term)
-
         weight = float(item.get("weight", 1.0))
 
         top_k_val = item.get("top_k")
@@ -391,34 +352,87 @@ def load_elements(path: str) -> List[Dict[str, Any]]:
             if top_k <= 0:
                 raise ValueError(f"Element '{elem_id}' top_k must be > 0")
 
+        cues_raw = item.get("cues")
+        cues: List[Dict[str, Any]]
+        if cues_raw is None:
+            term = str(item.get("term") or "").strip()
+            synonyms_raw = item.get("synonyms", [])
+            if synonyms_raw is None:
+                synonyms_raw = []
+            if isinstance(synonyms_raw, str):
+                synonyms_raw = [synonyms_raw]
+            if not isinstance(synonyms_raw, list):
+                raise ValueError(f"Element '{elem_id}' synonyms must be a list or string")
+            synonyms = [str(s).strip() for s in synonyms_raw if str(s).strip()]
+            if not term:
+                if synonyms:
+                    term = synonyms[0]
+                else:
+                    raise ValueError(f"Element '{elem_id}' requires a 'term' or non-empty synonyms")
+            cue_synonyms = _dedupe_preserve_order(s for s in synonyms if s != term)
+            cues = [{"term": term, "synonyms": cue_synonyms}]
+        else:
+            if not isinstance(cues_raw, list) or not cues_raw:
+                raise ValueError(f"Element '{elem_id}' cues must be a non-empty list")
+            cues = []
+            for cidx, cue in enumerate(cues_raw, start=1):
+                if not isinstance(cue, dict):
+                    raise ValueError(f"Element '{elem_id}' cue #{cidx} is not an object")
+                term = str(cue.get("term") or "").strip()
+                if not term:
+                    raise ValueError(f"Element '{elem_id}' cue #{cidx} missing 'term'")
+                syn_raw = cue.get("synonyms", [])
+                if syn_raw is None:
+                    syn_raw = []
+                if isinstance(syn_raw, str):
+                    syn_raw = [syn_raw]
+                if not isinstance(syn_raw, list):
+                    raise ValueError(f"Element '{elem_id}' cue #{cidx} synonyms must be list or string")
+                syn = [str(s).strip() for s in syn_raw if str(s).strip() and str(s).strip() != term]
+                cues.append({"term": term, "synonyms": _dedupe_preserve_order(syn)})
+
         normalized.append({
             "id": elem_id,
-            "role": role,
-            "term": term,
-            "synonyms": normalized_synonyms,
             "weight": weight,
             "top_k": top_k,
+            "cues": cues,
         })
 
     return normalized
 
 
+@dataclass
+class Cue:
+    term: str
+    synonyms: List[str]
+
+    def variants(self) -> List[str]:
+        return [self.term] + self.synonyms
+
+
+@dataclass
+class ElementDef:
+    id: str
+    weight: float
+    cues: List[Cue]
+    top_k: Optional[int] = None
+
+
 def to_element_defs(objs: List[Dict[str, Any]]) -> List[ElementDef]:
-    return [
-        ElementDef(
-            id=obj["id"],
-            role=obj["role"],
-            term=obj["term"],
-            synonyms=list(obj.get("synonyms", [])),
-            weight=float(obj.get("weight", 1.0)),
-            top_k=obj.get("top_k"),
+    elements: List[ElementDef] = []
+    for obj in objs:
+        cues = [Cue(term=c["term"], synonyms=list(c.get("synonyms", []))) for c in obj["cues"]]
+        if not cues:
+            raise ValueError(f"Element '{obj['id']}' must define at least one cue")
+        elements.append(
+            ElementDef(
+                id=obj["id"],
+                weight=float(obj.get("weight", 1.0)),
+                cues=cues,
+                top_k=obj.get("top_k"),
+            )
         )
-        for obj in objs
-    ]
-
-
-def variants_of(e: ElementDef) -> List[str]:
-    return [e.term] + _dedupe_preserve_order(e.synonyms)
+    return elements
 
 
 def phrase_to_terms(phrase: str) -> List[str]:
@@ -429,27 +443,15 @@ def bm25_phrase_score(index: BM25Index, ch: Chunk, phrase: str) -> float:
     return sum(index.score(ch.term_freq.get(t, 0), len(ch.term_freq), t) for t in phrase_to_terms(phrase))
 
 
-def element_chunk_score(index: BM25Index, ch: Chunk, e: ElementDef) -> Tuple[float, str]:
+def score_cue(index: BM25Index, ch: Chunk, cue: Cue) -> Tuple[float, str]:
     best_score = 0.0
     best_variant = ""
-    for variant in variants_of(e):
+    for variant in cue.variants():
         score = bm25_phrase_score(index, ch, variant)
         if score > best_score:
             best_score = score
             best_variant = variant
     return best_score, best_variant
-
-
-def chunk_eligible(
-    must_scores: Dict[str, float],
-    must_not_scores: Dict[str, float],
-    tau_must: float = 0.0,
-) -> bool:
-    if any(score < tau_must for score in must_scores.values()):
-        return False
-    if any(score > 0.0 for score in must_not_scores.values()):
-        return False
-    return True
 
 # ------------------------------
 # Normalization utilities
@@ -507,7 +509,7 @@ def chunk_and_rank(
     adjacent_penalty: float = 0.7,
     highlight: bool = False,
     normalize_method: str = "zscore",
-    tau_must: float = 0.0,
+    tau_cue: float = 0.0,
 ) -> Dict[str, Any]:
     if overlap_ratio is not None:
         overlap_tokens = max(0, int(round(chunk_tokens * float(overlap_ratio))))
@@ -519,55 +521,62 @@ def chunk_and_rank(
         sl = para_tags[ch.start_para: ch.end_para + 1]
         return Counter(sl).most_common(1)[0][0] if sl else "不明/Unknown"
 
-    must_elements = [e for e in elements if e.role == "must"]
-    should_elements = [e for e in elements if e.role == "should"]
-    must_not_elements = [e for e in elements if e.role == "must_not"]
-
     results: Dict[str, List[Dict[str, Any]]] = {e.id: [] for e in elements}
 
     for ch in chunks:
-        per_element: Dict[str, Tuple[float, str]] = {}
+        per_element_matches: Dict[str, Dict[str, Any]] = {}
+        chunk_satisfied = True
+        chunk_total_score = 0.0
         for e in elements:
-            per_element[e.id] = element_chunk_score(index, ch, e)
+            cue_matches: List[Dict[str, Any]] = []
+            cue_scores_sum = 0.0
+            element_ok = True
+            first_variant_for_highlight = ""
+            for cue in e.cues:
+                cue_score, variant = score_cue(index, ch, cue)
+                if not first_variant_for_highlight and variant:
+                    first_variant_for_highlight = variant
+                cue_matches.append({
+                    "cue_term": cue.term,
+                    "variant": variant,
+                    "score": cue_score,
+                })
+                if cue_score <= tau_cue:
+                    element_ok = False
+                cue_scores_sum += cue_score
+            if not element_ok:
+                chunk_satisfied = False
+                break
+            element_score = cue_scores_sum * e.weight
+            per_element_matches[e.id] = {
+                "matches": cue_matches,
+                "score": element_score,
+                "highlight_variant": first_variant_for_highlight,
+            }
+            chunk_total_score += element_score
 
-        must_scores = {e.id: per_element[e.id][0] for e in must_elements}
-        must_not_scores = {e.id: per_element[e.id][0] for e in must_not_elements}
-
-        if not chunk_eligible(must_scores, must_not_scores, tau_must=tau_must):
+        if not chunk_satisfied or chunk_total_score <= 0:
             continue
 
         section = chunk_section(ch)
         chunk_text = ch.text if include_text else None
-        total_score = sum(
-            per_element[e.id][0] * e.weight
-            for e in (*must_elements, *should_elements)
-        )
 
         for e in elements:
-            if e.role == "must_not":
-                continue
-            raw_score, variant = per_element[e.id]
-            if raw_score <= 0:
-                continue
-            weighted = raw_score * e.weight
-            if weighted <= 0:
-                continue
+            elem_info = per_element_matches[e.id]
             entry: Dict[str, Any] = {
                 "element_id": e.id,
-                "role": e.role,
-                "element_term": e.term,
-                "matched_variant": variant,
                 "chunk_idx": ch.idx,
                 "start_para": ch.start_para,
                 "end_para": ch.end_para,
                 "section": section,
-                "score": weighted,
-                "chunk_score_total": total_score,
+                "score": elem_info["score"],
+                "chunk_score_total": chunk_total_score,
+                "matched": elem_info["matches"],
             }
             if include_text:
                 entry["chunk"] = chunk_text
-            if highlight and variant and chunk_text:
-                phrase_pat = _build_phrase_regex(variant)
+            if highlight and elem_info["highlight_variant"] and chunk_text:
+                phrase_pat = _build_phrase_regex(elem_info["highlight_variant"])
                 highlighted = _highlight_sentence(chunk_text, phrase_pat)
                 if highlighted:
                     entry["chunk_highlight"] = highlighted
@@ -601,7 +610,7 @@ def chunk_and_rank(
             "num_chunks": len(index.chunks),
             "avgdl": index.avgdl,
             "normalize": normalize_method,
-            "tau_must": tau_must,
+            "tau_cue": tau_cue,
         },
         "chunks": chunks_out,
         "results": results,
